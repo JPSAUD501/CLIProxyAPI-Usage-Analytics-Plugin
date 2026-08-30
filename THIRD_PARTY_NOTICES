@@ -1,0 +1,8 @@
+CLIProxyAPI Usage Analytics Plugin includes or studies MIT-licensed software.
+
+- CLIProxyAPI, Copyright router-for-me contributors, MIT.
+- T3 Code, Copyright Ping Labs contributors, MIT. Its Usage information architecture was studied; no branding is used.
+- LiteLLM model pricing data, Copyright BerriAI contributors, MIT.
+- cpa-usage-statistics and codex-token-usage were reviewed as behavioral references. Their implementations were not copied.
+
+Dependency license details are available in the release SBOM.

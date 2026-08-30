@@ -1,0 +1,1 @@
+{"id":"usage-analytics","name":"Usage Analytics","version":"1.0.0","repository":"https://github.com/JPSAUD501/CLIProxyAPI-Usage-Analytics-Plugin","license":"MIT","artifacts":{"windows-amd64":"usage-analytics-windows-amd64.zip","linux-amd64":"usage-analytics-linux-amd64.tar.gz","linux-arm64":"usage-analytics-linux-arm64.tar.gz"}}
