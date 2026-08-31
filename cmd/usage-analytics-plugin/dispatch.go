@@ -9,7 +9,7 @@ import (
 	"net/http"
 )
 
-const pluginVersion = "1.1.0"
+const pluginVersion = "1.1.1"
 
 var pluginService = analytics.New(callHost)
 
@@ -72,7 +72,7 @@ func dispatch(method string, request []byte) (any, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, err
 		}
-		return pluginService.Management(req.ManagementRequest)
+		return pluginService.Management(req.ManagementRequest, req.HostCallbackID)
 	default:
 		return nil, &methodError{method: method}
 	}

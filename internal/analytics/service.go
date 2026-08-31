@@ -26,6 +26,7 @@ type Config struct {
 }
 type Service struct {
 	mu                sync.RWMutex
+	refreshMu         sync.Mutex
 	config            Config
 	store             *Store
 	queue             chan Event
@@ -92,7 +93,7 @@ func (s *Service) Configure(raw []byte) error {
 				s.openRouterPricing = pricing
 			}
 		}
-		s.once.Do(func() { go s.writer(); go s.pricingUpdater() })
+		s.once.Do(func() { go s.writer() })
 	}
 	s.config = cfg
 	return nil
@@ -138,9 +139,10 @@ func (s *Service) writer() {
 }
 
 type priceHTTPRequest struct {
-	Method, URL string
-	Headers     http.Header
-	Body        []byte
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+	Method, URL    string
+	Headers        http.Header
+	Body           []byte
 }
 type priceHTTPResponse struct {
 	StatusCode int         `json:"status_code"`
@@ -148,28 +150,43 @@ type priceHTTPResponse struct {
 	Body       []byte      `json:"body"`
 }
 
-func (s *Service) pricingUpdater() {
-	s.refreshPricing()
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			s.refreshPricing()
-		case <-s.done:
-			return
-		}
+func (r *priceHTTPResponse) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		CoreStatusCode      int         `json:"StatusCode"`
+		CanonicalStatusCode int         `json:"status_code"`
+		CoreHeaders         http.Header `json:"Headers"`
+		CanonicalHeaders    http.Header `json:"headers"`
+		CoreBody            []byte      `json:"Body"`
+		CanonicalBody       []byte      `json:"body"`
 	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return err
+	}
+	r.StatusCode = wire.CoreStatusCode
+	if r.StatusCode == 0 {
+		r.StatusCode = wire.CanonicalStatusCode
+	}
+	r.Headers = wire.CoreHeaders
+	if r.Headers == nil {
+		r.Headers = wire.CanonicalHeaders
+	}
+	r.Body = wire.CoreBody
+	if r.Body == nil {
+		r.Body = wire.CanonicalBody
+	}
+	return nil
 }
-func (s *Service) refreshPricing() {
+func (s *Service) refreshPricing(hostCallbackID string) {
 	if s.call == nil {
 		return
 	}
-	s.refreshCatalog("litellm", priceCatalogURL)
-	s.refreshCatalog("openrouter", openRouterCatalogURL)
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	s.refreshCatalog("litellm", priceCatalogURL, hostCallbackID)
+	s.refreshCatalog("openrouter", openRouterCatalogURL, hostCallbackID)
 }
-func (s *Service) refreshCatalog(key, catalogURL string) {
-	raw, err := s.call("host.http.do", priceHTTPRequest{Method: http.MethodGet, URL: catalogURL, Headers: http.Header{"Accept": {"application/json"}, "User-Agent": {"CLIProxyAPI-Usage-Analytics/1"}}})
+func (s *Service) refreshCatalog(key, catalogURL, hostCallbackID string) {
+	raw, err := s.call("host.http.do", priceHTTPRequest{HostCallbackID: hostCallbackID, Method: http.MethodGet, URL: catalogURL, Headers: http.Header{"Accept": {"application/json"}, "User-Agent": {"CLIProxyAPI-Usage-Analytics/1.1.1"}}})
 	if err != nil {
 		return
 	}
@@ -230,13 +247,21 @@ func (s *Service) Registration() pluginapi.ManagementRegistrationResponse {
 	}, Resources: []pluginapi.ResourceRoute{{Path: "/dashboard", Menu: "Usage analytics", Description: "Tokens, cache, cost and reliability analytics."}, {Path: "/dashboard.js"}}}
 }
 
-func (s *Service) Management(req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+func (s *Service) Management(req pluginapi.ManagementRequest, hostCallbackID string) (pluginapi.ManagementResponse, error) {
 	headers := http.Header{"Content-Type": {"application/json; charset=utf-8"}, "Cache-Control": {"no-store"}, "Content-Security-Policy": {"default-src 'none'; frame-ancestors 'none'"}}
 	if strings.HasSuffix(req.Path, "/dashboard.js") {
 		return pluginapi.ManagementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/javascript; charset=utf-8"}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}}, Body: DashboardJS()}, nil
 	}
 	if strings.HasSuffix(req.Path, "/dashboard") {
 		return pluginapi.ManagementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}, "Content-Security-Policy": {"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'self'"}}, Body: DashboardHTML()}, nil
+	}
+	if strings.HasSuffix(req.Path, "/summary") {
+		s.mu.RLock()
+		liteUpdated, openRouterUpdated := s.pricing.UpdatedAt, s.openRouterPricing.UpdatedAt
+		s.mu.RUnlock()
+		if liteUpdated.IsZero() || openRouterUpdated.IsZero() || time.Since(liteUpdated) > 24*time.Hour || time.Since(openRouterUpdated) > 24*time.Hour {
+			s.refreshPricing(hostCallbackID)
+		}
 	}
 	s.mu.RLock()
 	store := s.store

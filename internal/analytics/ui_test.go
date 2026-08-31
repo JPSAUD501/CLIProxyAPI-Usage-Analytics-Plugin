@@ -8,7 +8,7 @@ import (
 )
 
 func TestDashboardAllowsOnlySameOriginEmbedding(t *testing.T) {
-	response, err := New(nil).Management(pluginapi.ManagementRequest{Path: "/v0/resource/plugins/usage-analytics/dashboard"})
+	response, err := New(nil).Management(pluginapi.ManagementRequest{Path: "/v0/resource/plugins/usage-analytics/dashboard"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
