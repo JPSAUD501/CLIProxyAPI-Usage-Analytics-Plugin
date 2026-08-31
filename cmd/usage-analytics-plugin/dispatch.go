@@ -9,7 +9,7 @@ import (
 	"net/http"
 )
 
-const pluginVersion = "1.0.0"
+const pluginVersion = "1.1.0"
 
 var pluginService = analytics.New(callHost)
 

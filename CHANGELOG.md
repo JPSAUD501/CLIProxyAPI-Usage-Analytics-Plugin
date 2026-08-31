@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0 - 2026-08-30
+
+- Redesign the dashboard around the T3 Code usage hierarchy with provider series, totals, filters, and model breakdown.
+- Allow same-origin embedding in the CLIProxyAPI Management console while continuing to block third-party framing.
+- Use the OpenRouter model catalog for OpenRouter estimates and retain LiteLLM for other providers.
+- Reprice previously unpriced events after a catalog refresh without guessing ambiguous model aliases.
+
 ## 1.0.0 - 2026-08-30
 
 - Initial cross-platform release with usage accounting, SQLite persistence, cost estimation, Management API, and embedded dashboard.

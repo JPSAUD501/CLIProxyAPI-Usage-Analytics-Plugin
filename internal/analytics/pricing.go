@@ -14,12 +14,14 @@ import (
 var fallbackPrices []byte
 
 const priceCatalogURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+const openRouterCatalogURL = "https://openrouter.ai/api/v1/models"
 
 type ModelPrice struct{ Input, CacheRead, CacheCreation, Output int64 }
 type Pricing struct {
 	Source, Version string
 	UpdatedAt       time.Time
 	Models          map[string]ModelPrice
+	Aliases         map[string]string
 }
 
 func ParsePricing(raw []byte, source, version string) (Pricing, error) {
@@ -41,7 +43,57 @@ func ParsePricing(raw []byte, source, version string) (Pricing, error) {
 	if len(models) == 0 {
 		return Pricing{}, errors.New("pricing payload contains no usable models")
 	}
-	return Pricing{Source: source, Version: version, UpdatedAt: time.Now().UTC(), Models: models}, nil
+	return Pricing{Source: source, Version: version, UpdatedAt: time.Now().UTC(), Models: models, Aliases: uniqueAliases(models)}, nil
+}
+
+func ParseOpenRouterPricing(raw []byte, version string) (Pricing, error) {
+	var response struct {
+		Data []struct {
+			ID         string                     `json:"id"`
+			RawPricing map[string]json.RawMessage `json:"pricing"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return Pricing{}, errors.New("invalid OpenRouter pricing payload")
+	}
+	models := make(map[string]ModelPrice, len(response.Data))
+	for _, item := range response.Data {
+		input, okIn := nanoRate(item.RawPricing["prompt"])
+		output, okOut := nanoRate(item.RawPricing["completion"])
+		if strings.TrimSpace(item.ID) == "" || !okIn || !okOut {
+			continue
+		}
+		read, _ := nanoRate(item.RawPricing["input_cache_read"])
+		creation, _ := nanoRate(item.RawPricing["input_cache_write"])
+		models[item.ID] = ModelPrice{Input: input, CacheRead: read, CacheCreation: creation, Output: output}
+	}
+	if len(models) == 0 {
+		return Pricing{}, errors.New("OpenRouter pricing payload contains no usable models")
+	}
+	return Pricing{Source: "OpenRouter", Version: version, UpdatedAt: time.Now().UTC(), Models: models, Aliases: uniqueAliases(models)}, nil
+}
+
+func uniqueAliases(models map[string]ModelPrice) map[string]string {
+	aliases := map[string]string{}
+	ambiguous := map[string]bool{}
+	for id := range models {
+		base := id
+		if slash := strings.LastIndexByte(base, '/'); slash >= 0 {
+			base = base[slash+1:]
+		}
+		if strings.Contains(base, ":") {
+			continue
+		}
+		if existing, ok := aliases[base]; ok && existing != id {
+			ambiguous[base] = true
+		} else {
+			aliases[base] = id
+		}
+	}
+	for alias := range ambiguous {
+		delete(aliases, alias)
+	}
+	return aliases
 }
 func nanoRate(raw json.RawMessage) (int64, bool) {
 	if len(raw) == 0 || string(raw) == "null" {
@@ -57,8 +109,23 @@ func nanoRate(raw json.RawMessage) (int64, bool) {
 	}
 	return int64(math.Round(f * 1e9)), true
 }
-func (p Pricing) Cost(model string, b TokenBreakdown) (int64, int64, bool) {
-	candidates := []string{model, "openai/" + model, "anthropic/" + model}
+func (p Pricing) Cost(provider, model string, b TokenBreakdown) (int64, int64, bool) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "openrouter" && p.Source != "OpenRouter" {
+		return 0, 0, false
+	}
+	candidates := []string{}
+	providerPrefixes := map[string][]string{
+		"codex": {"openai"}, "openai": {"openai"}, "anthropic": {"anthropic"},
+		"xai": {"xai"}, "kimi": {"moonshot"},
+	}
+	for _, prefix := range providerPrefixes[provider] {
+		candidates = append(candidates, prefix+"/"+model)
+	}
+	candidates = append(candidates, model)
+	if alias, exists := p.Aliases[model]; exists {
+		candidates = append(candidates, alias)
+	}
 	var rate ModelPrice
 	ok := false
 	for _, id := range candidates {

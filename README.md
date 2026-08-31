@@ -7,7 +7,7 @@ Native usage analytics for [CLIProxyAPI](https://github.com/router-for-me/CLIPro
 - Canonical non-overlapping accounting for input, cache read/write, output, reasoning, and unclassified tokens.
 - SQLite WAL storage with transactional migrations and 90-day default retention.
 - Stable HMAC client identities; raw inference keys are never persisted.
-- LiteLLM pricing with a last-known-good cache, versioned fallback, nano-USD arithmetic, and explicit unpriced events.
+- Provider-aware pricing: the OpenRouter catalog is authoritative for OpenRouter models, while the LiteLLM table is used for other providers. Both use last-known-good caches, nano-USD arithmetic, exact non-ambiguous model matching, and explicit unpriced events.
 - Embedded React dashboard in PT-BR and English.
 
 ## Configuration
@@ -22,7 +22,7 @@ plugins:
       identity_mode: full
 ```
 
-Open `/v0/resource/plugins/usage-analytics/dashboard` and enter the Management key. The key remains in the tab's session storage.
+Open `/v0/resource/plugins/usage-analytics/dashboard` directly or from the CLIProxyAPI Management sidebar and enter the Management key. The key remains in the tab's session storage.
 
 ## Development
 

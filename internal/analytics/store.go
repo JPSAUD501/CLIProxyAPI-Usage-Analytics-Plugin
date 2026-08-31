@@ -112,7 +112,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS usage_events_auth_time ON usage_events(auth_id, requested_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS identity_labels(kind TEXT NOT NULL, identity TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY(kind,identity))`,
 		`CREATE TABLE IF NOT EXISTS pricing_state(id INTEGER PRIMARY KEY CHECK(id=1), source TEXT NOT NULL, version TEXT NOT NULL, updated_at TEXT NOT NULL, payload BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS pricing_catalogs(catalog_key TEXT PRIMARY KEY, source TEXT NOT NULL, version TEXT NOT NULL, updated_at TEXT NOT NULL, payload BLOB NOT NULL)`,
 		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, datetime('now'))`,
+		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, datetime('now'))`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -197,6 +199,40 @@ func (s *Store) percentile(ctx context.Context, column string, p float64, where 
 type BreakdownRow struct {
 	Key                                   string `json:"key"`
 	Requests, Failed, Tokens, CostNanoUSD int64
+}
+
+type SeriesRow struct {
+	Bucket, Provider              string
+	Requests, Tokens, CostNanoUSD int64
+}
+
+func (s *Store) Series(ctx context.Context, f Filters, bucket string, timezoneOffset int) ([]SeriesRow, error) {
+	if bucket != "hour" && bucket != "day" {
+		return nil, errors.New("invalid bucket")
+	}
+	if timezoneOffset < -840 || timezoneOffset > 840 {
+		return nil, errors.New("invalid timezone offset")
+	}
+	where, args := filterClause(f)
+	modifier := fmt.Sprintf("%+d minutes", -timezoneOffset)
+	format := "%Y-%m-%d"
+	if bucket == "hour" {
+		format = "%Y-%m-%dT%H:00:00"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT strftime(?,requested_at,?),provider,COUNT(*),COALESCE(SUM(total_tokens),0),COALESCE(SUM(cost_nano_usd),0) FROM usage_events WHERE `+where+` GROUP BY 1,2 ORDER BY 1,2`, append([]any{format, modifier}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SeriesRow{}
+	for rows.Next() {
+		var row SeriesRow
+		if err := rows.Scan(&row.Bucket, &row.Provider, &row.Requests, &row.Tokens, &row.CostNanoUSD); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) Breakdown(ctx context.Context, f Filters, dimension string) ([]BreakdownRow, error) {
@@ -301,6 +337,57 @@ func (s *Store) SetLabel(ctx context.Context, kind, id, label string) error {
 func (s *Store) SavePricing(ctx context.Context, source, version string, payload []byte) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO pricing_state(id,source,version,updated_at,payload) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,version=excluded.version,updated_at=excluded.updated_at,payload=excluded.payload`, source, version, time.Now().UTC().Format(time.RFC3339Nano), payload)
 	return err
+}
+func (s *Store) SavePricingCatalog(ctx context.Context, key, source, version string, payload []byte) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO pricing_catalogs(catalog_key,source,version,updated_at,payload) VALUES(?,?,?,?,?) ON CONFLICT(catalog_key) DO UPDATE SET source=excluded.source,version=excluded.version,updated_at=excluded.updated_at,payload=excluded.payload`, key, source, version, time.Now().UTC().Format(time.RFC3339Nano), payload)
+	return err
+}
+func (s *Store) LoadPricingCatalog(ctx context.Context, key string) (string, string, time.Time, []byte, error) {
+	var source, version, updated string
+	var payload []byte
+	err := s.db.QueryRowContext(ctx, `SELECT source,version,updated_at,payload FROM pricing_catalogs WHERE catalog_key=?`, key).Scan(&source, &version, &updated, &payload)
+	if err != nil {
+		return "", "", time.Time{}, nil, err
+	}
+	at, err := time.Parse(time.RFC3339Nano, updated)
+	return source, version, at, payload, err
+}
+func (s *Store) RepriceUnpriced(ctx context.Context, pricing Pricing, provider string) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,provider,model,input_uncached,cache_read,cache_creation,output_non_reasoning,reasoning FROM usage_events WHERE cost_nano_usd IS NULL AND (?='' OR provider=?)`, provider, provider)
+	if err != nil {
+		return 0, err
+	}
+	type update struct{ id, cost, savings int64 }
+	updates := []update{}
+	for rows.Next() {
+		var id int64
+		var eventProvider, model string
+		var b TokenBreakdown
+		if err := rows.Scan(&id, &eventProvider, &model, &b.InputUncached, &b.CacheRead, &b.CacheCreation, &b.OutputNonReasoning, &b.Reasoning); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if cost, savings, ok := pricing.Cost(eventProvider, model, b); ok {
+			updates = append(updates, update{id, cost, savings})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	for _, item := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE usage_events SET cost_nano_usd=?,cache_savings_nano_usd=?,price_version=? WHERE id=? AND cost_nano_usd IS NULL`, item.cost, item.savings, pricing.Source+":"+pricing.Version, item.id); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(updates)), nil
 }
 func (s *Store) LoadPricing(ctx context.Context) (string, string, time.Time, []byte, error) {
 	var source, version, updated string
