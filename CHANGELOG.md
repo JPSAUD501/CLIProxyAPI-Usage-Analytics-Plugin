@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1 - 2026-08-30
+
+- Refresh pricing catalogs through the authenticated Management host callback and accept both core and canonical HTTP response wire shapes.
+
 ## 1.1.0 - 2026-08-30
 
 - Redesign the dashboard around the T3 Code usage hierarchy with provider series, totals, filters, and model breakdown.

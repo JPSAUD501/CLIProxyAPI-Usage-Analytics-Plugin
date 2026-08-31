@@ -1,6 +1,10 @@
 package analytics
 
-import "testing"
+import (
+	"encoding/json"
+	"net/http"
+	"testing"
+)
 
 func TestOpenRouterPricingResolvesUniqueShortModelID(t *testing.T) {
 	raw := []byte(`{"data":[{"id":"z-ai/glm-5.3-flash","pricing":{"prompt":"0.000000075","completion":"0.00000025","input_cache_read":"0.000000015"}},{"id":"z-ai/glm-5.3-flash:batch","pricing":{"prompt":"0.00000015","completion":"0.0000005"}}]}`)
@@ -40,8 +44,25 @@ func TestLiteLLMPricingUsesProviderScopedPrefix(t *testing.T) {
 func TestOpenRouterEventsNeverUseLiteLLMEstimate(t *testing.T) {
 	raw := []byte(`{"glm-5.3-flash":{"input_cost_per_token":0.000009,"output_cost_per_token":0.000009}}`)
 	pricing, err := ParsePricing(raw, "LiteLLM", "test")
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, _, ok := pricing.Cost("openrouter", "glm-5.3-flash", TokenBreakdown{InputUncached: 1}); ok {
 		t.Fatal("OpenRouter usage must use the OpenRouter catalog")
+	}
+}
+
+func TestCatalogRefreshForwardsHostCallbackAndAcceptsCoreWireShape(t *testing.T) {
+	payload := []byte(`{"data":[{"id":"z-ai/glm-5.3-flash","pricing":{"prompt":"0.000000075","completion":"0.00000025"}}]}`)
+	service := New(func(method string, value any) (json.RawMessage, error) {
+		request, ok := value.(priceHTTPRequest)
+		if method != "host.http.do" || !ok || request.HostCallbackID != "callback-1" {
+			t.Fatalf("unexpected host request: %s %#v", method, value)
+		}
+		return json.Marshal(map[string]any{"StatusCode": http.StatusOK, "Headers": http.Header{"ETag": {"test"}}, "Body": payload})
+	})
+	service.refreshCatalog("openrouter", openRouterCatalogURL, "callback-1")
+	if service.openRouterPricing.Source != "OpenRouter" || len(service.openRouterPricing.Models) != 1 {
+		t.Fatalf("catalog was not refreshed: %#v", service.openRouterPricing)
 	}
 }
