@@ -186,7 +186,7 @@ func (s *Service) refreshPricing(hostCallbackID string) {
 	s.refreshCatalog("openrouter", openRouterCatalogURL, hostCallbackID)
 }
 func (s *Service) refreshCatalog(key, catalogURL, hostCallbackID string) {
-	raw, err := s.call("host.http.do", priceHTTPRequest{HostCallbackID: hostCallbackID, Method: http.MethodGet, URL: catalogURL, Headers: http.Header{"Accept": {"application/json"}, "User-Agent": {"CLIProxyAPI-Usage-Analytics/1.1.1"}}})
+	raw, err := s.call("host.http.do", priceHTTPRequest{HostCallbackID: hostCallbackID, Method: http.MethodGet, URL: catalogURL, Headers: http.Header{"Accept": {"application/json"}, "User-Agent": {"CLIProxyAPI-Usage-Analytics/1.2.0"}}})
 	if err != nil {
 		return
 	}
