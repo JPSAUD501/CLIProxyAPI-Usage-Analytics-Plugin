@@ -25,15 +25,16 @@ type Config struct {
 	IdentityMode  string `yaml:"identity_mode"`
 }
 type Service struct {
-	mu      sync.RWMutex
-	config  Config
-	store   *Store
-	queue   chan Event
-	done    chan struct{}
-	dropped atomic.Int64
-	once    sync.Once
-	call    HostCaller
-	pricing Pricing
+	mu                sync.RWMutex
+	config            Config
+	store             *Store
+	queue             chan Event
+	done              chan struct{}
+	dropped           atomic.Int64
+	once              sync.Once
+	call              HostCaller
+	pricing           Pricing
+	openRouterPricing Pricing
 }
 
 type HostCaller func(method string, payload any) (json.RawMessage, error)
@@ -84,6 +85,13 @@ func (s *Service) Configure(raw []byte) error {
 				s.pricing = pricing
 			}
 		}
+		if source, version, updated, payload, err := store.LoadPricingCatalog(context.Background(), "openrouter"); err == nil {
+			if pricing, err := ParseOpenRouterPricing(payload, version); err == nil {
+				pricing.Source = source
+				pricing.UpdatedAt = updated
+				s.openRouterPricing = pricing
+			}
+		}
 		s.once.Do(func() { go s.writer(); go s.pricingUpdater() })
 	}
 	s.config = cfg
@@ -103,8 +111,12 @@ func (s *Service) writer() {
 			if store != nil && cfg.Enabled {
 				s.mu.RLock()
 				pricing := s.pricing
+				openRouterPricing := s.openRouterPricing
 				s.mu.RUnlock()
-				if cost, savings, ok := pricing.Cost(event.Model, event.Tokens); ok {
+				if strings.EqualFold(event.Provider, "openrouter") && len(openRouterPricing.Models) > 0 {
+					pricing = openRouterPricing
+				}
+				if cost, savings, ok := pricing.Cost(event.Provider, event.Model, event.Tokens); ok {
 					event.CostNanoUSD = &cost
 					event.CacheSavingsNanoUSD = &savings
 					event.PriceVersion = pricing.Version
@@ -153,7 +165,11 @@ func (s *Service) refreshPricing() {
 	if s.call == nil {
 		return
 	}
-	raw, err := s.call("host.http.do", priceHTTPRequest{Method: http.MethodGet, URL: priceCatalogURL, Headers: http.Header{"Accept": {"application/json"}}})
+	s.refreshCatalog("litellm", priceCatalogURL)
+	s.refreshCatalog("openrouter", openRouterCatalogURL)
+}
+func (s *Service) refreshCatalog(key, catalogURL string) {
+	raw, err := s.call("host.http.do", priceHTTPRequest{Method: http.MethodGet, URL: catalogURL, Headers: http.Header{"Accept": {"application/json"}, "User-Agent": {"CLIProxyAPI-Usage-Analytics/1"}}})
 	if err != nil {
 		return
 	}
@@ -162,16 +178,31 @@ func (s *Service) refreshPricing() {
 		return
 	}
 	version := priceVersion(resp.Headers)
-	pricing, err := ParsePricing(resp.Body, "LiteLLM", version)
+	var pricing Pricing
+	if key == "openrouter" {
+		pricing, err = ParseOpenRouterPricing(resp.Body, version)
+	} else {
+		pricing, err = ParsePricing(resp.Body, "LiteLLM", version)
+	}
 	if err != nil {
 		return
 	}
 	s.mu.Lock()
 	store := s.store
-	s.pricing = pricing
+	if key == "openrouter" {
+		s.openRouterPricing = pricing
+	} else {
+		s.pricing = pricing
+	}
 	s.mu.Unlock()
 	if store != nil {
-		_ = store.SavePricing(context.Background(), pricing.Source, pricing.Version, resp.Body)
+		if key == "openrouter" {
+			_ = store.SavePricingCatalog(context.Background(), key, pricing.Source, pricing.Version, resp.Body)
+			_, _ = store.RepriceUnpriced(context.Background(), pricing, "openrouter")
+		} else {
+			_ = store.SavePricing(context.Background(), pricing.Source, pricing.Version, resp.Body)
+			_, _ = store.RepriceUnpriced(context.Background(), pricing, "")
+		}
 	}
 }
 
@@ -195,7 +226,7 @@ func (s *Service) HandleUsage(record pluginapi.UsageRecord) {
 
 func (s *Service) Registration() pluginapi.ManagementRegistrationResponse {
 	return pluginapi.ManagementRegistrationResponse{Routes: []pluginapi.ManagementRoute{
-		{Method: http.MethodGet, Path: "/plugins/usage-analytics/summary"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/breakdown"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/requests"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/identities"}, {Method: http.MethodPatch, Path: "/plugins/usage-analytics/labels"}, {Method: http.MethodPost, Path: "/plugins/usage-analytics/maintenance/purge"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/health"},
+		{Method: http.MethodGet, Path: "/plugins/usage-analytics/summary"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/breakdown"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/series"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/requests"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/identities"}, {Method: http.MethodPatch, Path: "/plugins/usage-analytics/labels"}, {Method: http.MethodPost, Path: "/plugins/usage-analytics/maintenance/purge"}, {Method: http.MethodGet, Path: "/plugins/usage-analytics/health"},
 	}, Resources: []pluginapi.ResourceRoute{{Path: "/dashboard", Menu: "Usage analytics", Description: "Tokens, cache, cost and reliability analytics."}, {Path: "/dashboard.js"}}}
 }
 
@@ -205,12 +236,13 @@ func (s *Service) Management(req pluginapi.ManagementRequest) (pluginapi.Managem
 		return pluginapi.ManagementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/javascript; charset=utf-8"}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}}, Body: DashboardJS()}, nil
 	}
 	if strings.HasSuffix(req.Path, "/dashboard") {
-		return pluginapi.ManagementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}, "Content-Security-Policy": {"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"}}, Body: DashboardHTML()}, nil
+		return pluginapi.ManagementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}, "Content-Security-Policy": {"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'self'"}}, Body: DashboardHTML()}, nil
 	}
 	s.mu.RLock()
 	store := s.store
 	cfg := s.config
 	pricing := s.pricing
+	openRouterPricing := s.openRouterPricing
 	s.mu.RUnlock()
 	if store == nil {
 		return jsonResponse(headers, 503, map[string]any{"error": "store_unavailable"})
@@ -227,9 +259,16 @@ func (s *Service) Management(req pluginapi.ManagementRequest) (pluginapi.Managem
 		if err != nil {
 			return pluginapi.ManagementResponse{}, err
 		}
-		return jsonResponse(headers, 200, map[string]any{"data": data, "dropped_events": s.dropped.Load(), "retention_days": cfg.RetentionDays, "pricing": map[string]any{"source": pricing.Source, "version": pricing.Version, "updated_at": pricing.UpdatedAt}})
+		return jsonResponse(headers, 200, map[string]any{"data": data, "dropped_events": s.dropped.Load(), "retention_days": cfg.RetentionDays, "pricing": []map[string]any{{"source": pricing.Source, "version": pricing.Version, "updated_at": pricing.UpdatedAt}, {"source": openRouterPricing.Source, "version": openRouterPricing.Version, "updated_at": openRouterPricing.UpdatedAt}}})
 	case strings.HasSuffix(req.Path, "/breakdown"):
 		data, err := store.Breakdown(ctx, filters, req.Query.Get("dimension"))
+		if err != nil {
+			return jsonResponse(headers, 400, map[string]any{"error": err.Error()})
+		}
+		return jsonResponse(headers, 200, map[string]any{"data": data})
+	case strings.HasSuffix(req.Path, "/series"):
+		offset, _ := strconv.Atoi(req.Query.Get("timezone_offset"))
+		data, err := store.Series(ctx, filters, req.Query.Get("bucket"), offset)
 		if err != nil {
 			return jsonResponse(headers, 400, map[string]any{"error": err.Error()})
 		}
