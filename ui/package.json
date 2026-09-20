@@ -13,7 +13,7 @@
     "vite-plugin-singlefile": "2.3.3",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "zod": "4.5.4"
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/react": "19.2.18",
